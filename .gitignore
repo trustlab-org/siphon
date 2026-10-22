@@ -2,3 +2,4 @@ tlsoc-notes
 bin/
 state/
 secrets/
+deploy/gws/gws.env
