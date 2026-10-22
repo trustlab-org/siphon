@@ -21,7 +21,6 @@ const (
 	fCredentials     = "credentials_file"
 	fSubject         = "subject"
 	fCustomerID      = "customer_id"
-	fEndpoint        = "endpoint"
 	fApplications    = "applications"
 	fOrg             = "org"
 	fServer          = "server"
@@ -32,6 +31,7 @@ const (
 	fOverlaps        = "overlaps"
 	fInitialLookback = "initial_lookback"
 	fMaxWindow       = "max_window"
+	fUnavailableWait = "unavailable_retry"
 	fBackoff         = "backoff"
 	fCheckpoint      = "checkpoint"
 )
@@ -49,7 +49,7 @@ func spec() *service.ConfigSpec {
 		Summary("Pulls Google Workspace audit activity from the Admin SDK Reports API.").
 		Fields(
 			service.NewStringField(fCredentials).
-				Description("Path to the service account JSON key. Mount it; never bake it into an image. Empty only with a test endpoint.").
+				Description("Path to the service account JSON key. Mount it; never bake it into an image.").
 				Default(""),
 			service.NewStringField(fSubject).
 				Description("Admin user the service account impersonates via domain-wide delegation.").
@@ -58,15 +58,11 @@ func spec() *service.ConfigSpec {
 			service.NewStringField(fCustomerID).
 				Description("Workspace customer id; empty uses the subject's own customer.").
 				Default(""),
-			service.NewStringField(fEndpoint).
-				Description("Override the API base URL, e.g. a local fake server for testing.").
-				Advanced().
-				Default(""),
 			service.NewStringListField(fApplications).
 				Description("Reports API applicationName values to collect, each with its own cursor.").
 				Default([]string{"login"}),
 			service.NewStringField(fOrg).Description("Organisation name for meta.org."),
-			service.NewStringField(fServer).Description("Tenant domain for meta.server.").Example("example.ac.in"),
+			service.NewStringField(fServer).Description("meta.server value; it names the index series downstream.").Example("google-workspace"),
 			service.NewDurationField(fInterval).Default("1m"),
 			service.NewDurationField(fRecheck).
 				Description("How far every poll reaches behind the cursor.").
@@ -87,6 +83,10 @@ func spec() *service.ConfigSpec {
 			service.NewDurationField(fMaxWindow).
 				Description("Largest single window, bounding backfill work per commit.").
 				Default("6h"),
+			service.NewDurationField(fUnavailableWait).
+				Description("How often to re-check a log type the tenant's plan or permissions do not offer.").
+				Advanced().
+				Default("1h"),
 			service.NewBackOffField(fBackoff, false, &backoff.ExponentialBackOff{
 				InitialInterval: time.Second,
 				MaxInterval:     2 * time.Minute,
@@ -100,7 +100,6 @@ type input struct {
 	credentials string
 	subject     string
 	customerID  string
-	endpoint    string
 	apps        []string
 	overlaps    map[string]time.Duration
 	meta        envelope.Meta
@@ -129,11 +128,8 @@ func newInput(conf *service.ParsedConfig, res *service.Resources) (service.Batch
 	if in.customerID, err = conf.FieldString(fCustomerID); err != nil {
 		return nil, err
 	}
-	if in.endpoint, err = conf.FieldString(fEndpoint); err != nil {
-		return nil, err
-	}
-	if in.endpoint == "" && (in.credentials == "" || in.subject == "") {
-		return nil, errors.New("credentials_file and subject are required unless endpoint is set")
+	if in.credentials == "" || in.subject == "" {
+		return nil, errors.New("credentials_file and subject are required")
 	}
 	if in.apps, err = conf.FieldStringList(fApplications); err != nil {
 		return nil, err
@@ -178,7 +174,10 @@ func parseTiming(conf *service.ParsedConfig) (t timing, err error) {
 	if t.maxWindow, err = conf.FieldDuration(fMaxWindow); err != nil {
 		return
 	}
-	if t.interval <= 0 || t.maxWindow <= 0 || t.recheck < 0 || t.sweepInterval < 0 || t.initialLookback < 0 {
+	if t.unavailableWait, err = conf.FieldDuration(fUnavailableWait); err != nil {
+		return
+	}
+	if t.interval <= 0 || t.maxWindow <= 0 || t.unavailableWait <= 0 || t.recheck < 0 || t.sweepInterval < 0 || t.initialLookback < 0 {
 		err = errors.New("poll_interval and max_window must be positive; other durations non-negative")
 	}
 	return
@@ -202,7 +201,7 @@ func (in *input) Connect(ctx context.Context) error {
 	if in.started {
 		return nil
 	}
-	cl, err := newClient(ctx, in.endpoint, in.credentials, in.subject, in.customerID)
+	cl, err := newClient(in.credentials, in.subject, in.customerID)
 	if err != nil {
 		return err
 	}

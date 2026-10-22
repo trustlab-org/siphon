@@ -7,7 +7,6 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/warpstreamlabs/bento/public/service"
-	reports "google.golang.org/api/admin/reports/v1"
 
 	"github.com/HelixY2J/collector/internal/checkpoint"
 	"github.com/HelixY2J/collector/internal/dedupe"
@@ -16,7 +15,7 @@ import (
 )
 
 type pager interface {
-	page(ctx context.Context, app string, start, end time.Time, token string) (*reports.Activities, error)
+	page(ctx context.Context, app string, start, end time.Time, token string) (*activityPage, error)
 }
 
 type timing struct {
@@ -25,25 +24,28 @@ type timing struct {
 	sweepInterval   time.Duration
 	initialLookback time.Duration
 	maxWindow       time.Duration
+	unavailableWait time.Duration
 }
 
 type metrics struct {
-	emitted  *service.MetricCounter
-	late     *service.MetricCounter
-	skipped  *service.MetricCounter
-	errors   *service.MetricCounter
-	lag      *service.MetricGauge
-	lateness *service.MetricTimer
+	emitted   *service.MetricCounter
+	late      *service.MetricCounter
+	skipped   *service.MetricCounter
+	errors    *service.MetricCounter
+	lag       *service.MetricGauge
+	lateness  *service.MetricTimer
+	available *service.MetricGauge
 }
 
 func newMetrics(m *service.Metrics) metrics {
 	return metrics{
-		emitted:  m.NewCounter("collector_events_emitted", "source", "application"),
-		late:     m.NewCounter("collector_events_late", "source", "application"),
-		skipped:  m.NewCounter("collector_events_malformed", "source", "application"),
-		errors:   m.NewCounter("collector_poll_errors", "source", "application"),
-		lag:      m.NewGauge("collector_cursor_lag_seconds", "source", "application"),
-		lateness: m.NewTimer("collector_event_lateness", "source", "application"),
+		emitted:   m.NewCounter("collector_events_emitted", "source", "application"),
+		late:      m.NewCounter("collector_events_late", "source", "application"),
+		skipped:   m.NewCounter("collector_events_malformed", "source", "application"),
+		errors:    m.NewCounter("collector_poll_errors", "source", "application"),
+		lag:       m.NewGauge("collector_cursor_lag_seconds", "source", "application"),
+		lateness:  m.NewTimer("collector_event_lateness", "source", "application"),
+		available: m.NewGauge("collector_application_available", "source", "application"),
 	}
 }
 
@@ -63,6 +65,7 @@ type stream struct {
 	m       metrics
 	now     func() time.Time
 	primed  bool
+	dormant bool
 }
 
 // span is one poll: fetch [cursor-back, end) and commit end.
@@ -91,11 +94,17 @@ func (s *stream) run(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
+			if unavailable(err) {
+				s.markUnavailable(err)
+				pull.Sleep(ctx, s.timing.unavailableWait)
+				continue
+			}
 			s.m.errors.Incr(1, sourceName, s.app)
 			s.log.Errorf("%s: window %s..%s failed: %v", s.app, cursor.Format(time.RFC3339), sp.end.Format(time.RFC3339), err)
 			pull.Sleep(ctx, s.timing.interval)
 			continue
 		}
+		s.markAvailable()
 		if sweeping {
 			lastSweep = now
 		}
@@ -114,7 +123,7 @@ func (s *stream) window(ctx context.Context, sp span) error {
 	fresh := map[string]time.Time{}
 	token := ""
 	for {
-		var page *reports.Activities
+		var page *activityPage
 		err := pull.Retry(ctx, s.boff, retryable, s.onRetry, func() (err error) {
 			page, err = s.pager.page(ctx, s.app, start, sp.end, token)
 			return err
@@ -165,7 +174,7 @@ func (s *stream) record(sp span, fresh map[string]time.Time) {
 	s.m.late.Incr(int64(late), sourceName, s.app)
 }
 
-func (s *stream) batch(items []*reports.Activity, fresh map[string]time.Time) service.MessageBatch {
+func (s *stream) batch(items []map[string]any, fresh map[string]time.Time) service.MessageBatch {
 	var batch service.MessageBatch
 	for _, a := range items {
 		evs, err := split(a, s.app, s.meta)
@@ -207,6 +216,23 @@ func (s *stream) loadCursor(ctx context.Context) (time.Time, bool) {
 		if !pull.Sleep(ctx, s.timing.interval) {
 			return time.Time{}, false
 		}
+	}
+}
+
+// markUnavailable logs once when the tenant's plan or permissions do not offer this log type; polling continues at a slow rate.
+func (s *stream) markUnavailable(err error) {
+	s.m.available.Set(0, sourceName, s.app)
+	if !s.dormant {
+		s.dormant = true
+		s.log.Warnf("%s: not available to this tenant (%v); retrying every %s", s.app, err, s.timing.unavailableWait)
+	}
+}
+
+func (s *stream) markAvailable() {
+	s.m.available.Set(1, sourceName, s.app)
+	if s.dormant {
+		s.dormant = false
+		s.log.Infof("%s: available again", s.app)
 	}
 }
 
