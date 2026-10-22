@@ -26,35 +26,29 @@ Requires Go 1.27+.
 go build -o bin/siphon ./cmd/collector
 ```
 
-To build for a Linux server from another OS:
-
-```bash
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/siphon ./cmd/collector
-```
-
 ## Google Workspace setup
 
 A super admin account is needed for these steps
 
 ### 1. Create a reports user
 
-1. In the Admin console (admin.google.com), go to Directory, Users, Add new user, for example `reports@your-domain`.
+1. In the [Admin console](https://admin.google.com), go to [Directory, Users](https://admin.google.com/ac/users), Add new user, for example `reports@your-domain`.
 2. Sign in once as this user and accept the terms. Set a long password and store it; Siphon does not use it.
-3. Go to Account, Admin roles, Create new role. Name it "Reports reader" and select only the Reports privilege.
+3. Go to [Account, Admin roles](https://admin.google.com/ac/roles), Create new role. Name it "Reports reader" and select only the Reports privilege.
 4. Assign the role to the reports user.
 
 ### 2. Create a service account and key
 
-1. In Google Cloud, signed in as the super admin, create a project inside your organization.
-2. Go to APIs & Services, Library and enable the Admin SDK API.
-3. Go to IAM & Admin, Service accounts, Create service account. Do not grant it any roles.
+1. In [Google Cloud console](https://console.cloud.google.com), signed in as the super admin and create inside your organization.
+2. Go to APIs & Services, Library and enable the [Admin SDK API](https://console.cloud.google.com/apis/library/admin.googleapis.com).
+3. Go to [IAM & Admin, Service accounts](https://console.cloud.google.com/iam-admin/serviceaccounts), Create service account. Do not grant it any roles.
 4. Open the service account then Keys, there Create new key, JSON. The key file downloads.
-5. If key creation is blocked, the organization policy "Disable service account key creation" is on. Override it for this project only, create the key, then set the policy back to "Inherit parent's policy". The key keeps working.
+5. If key creation is blocked, the [organization policy](https://console.cloud.google.com/iam-admin/orgpolicies) "Disable service account key creation" is on. Override it for this project only, create the key, then set the policy back to "Inherit parent's policy". The key keeps working.
 6. Copy the service account's Unique ID from its details page.
 
 ### 3. Allow domain-wide delegation
 
-1. In the Admin console, go to Security then Access and data control then API controls, Manage Domain Wide Delegation, Add new.
+1. In the Admin console, go to Security, Access and data control, API controls, [Manage Domain Wide Delegation](https://admin.google.com/ac/owl/domainwidedelegation), Add new.
 2. Client ID: the Unique ID from step 2.6.
 3. OAuth scope: `https://www.googleapis.com/auth/admin.reports.audit.readonly`
 4. Authorize.
@@ -74,5 +68,3 @@ A super admin account is needed for these steps
    ```bash
    ./bin/siphon -e deploy/gws/gws.env -c config/google-workspace.yaml
    ```
-
-Metrics are served at `http://127.0.0.1:4195/metrics`.
