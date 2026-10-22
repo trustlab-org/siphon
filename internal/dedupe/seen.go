@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// Seen remembers event ids by event time so overlapping poll windows don't re-emit them.
+// seen remembers event ids by event time so overlapping poll windows dont reemit them
 type Seen struct {
 	mu  sync.Mutex
 	ids map[string]time.Time
@@ -28,7 +28,7 @@ func (s *Seen) Add(id string, at time.Time) {
 	s.ids[id] = at
 }
 
-// Prune drops ids older than the earliest time any future window can query.
+// Prune drops ids older than the earliest time any future window can query
 func (s *Seen) Prune(before time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

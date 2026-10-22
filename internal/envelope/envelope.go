@@ -7,10 +7,10 @@ import (
 	"strings"
 )
 
-// Envelope matches the rsyslog/omkafka shape the engine consumes, with structured data in JSON instead of Raw.
+// Envelope matches the rsyslog/omkafka shape; Raw carries the vendor event as a JSON string for the engine's json_map rules.
 type Envelope struct {
-	Meta Meta            `json:"meta"`
-	JSON json.RawMessage `json:"json"`
+	Meta Meta   `json:"meta"`
+	Raw  string `json:"raw"`
 }
 
 type Meta struct {
