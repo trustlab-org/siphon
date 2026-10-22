@@ -1,15 +1,15 @@
 http:
-  address: 0.0.0.0:4195
+  address: ${COLLECTOR_HTTP_ADDR:0.0.0.0:4195}
 
 input:
   google_workspace:
-    credentials_file: ${GWS_CREDENTIALS_FILE:./secrets/google-sa.json}
+    credentials_file: ${GWS_CREDENTIALS_FILE:}
     subject: ${GWS_ADMIN_SUBJECT:admin@example.ac.in}
     org: ${COLLECTOR_ORG:example-university}
-    server: ${GWS_DOMAIN:example.ac.in}
-    applications: [ login ]
+    server: ${COLLECTOR_SERVER:google-workspace}
+    applications: [ login, admin, token, drive, user_accounts, gmail, saml, groups, takeout, rules, context_aware_access, admin_data_action, calendar, meet ]
     poll_interval: 1m
-    initial_lookback: 24h
+    initial_lookback: ${GWS_INITIAL_LOOKBACK:24h}
     checkpoint:
       type: file
       path: ${COLLECTOR_STATE_DIR:./state}/checkpoints.json
