@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"time"
 
+	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	reports "google.golang.org/api/admin/reports/v1"
 	"google.golang.org/api/googleapi"
@@ -34,18 +35,27 @@ type client struct {
 }
 
 func newClient(credentialsFile, subject, customerID string) (*client, error) {
+	h, err := delegatedHTTP(credentialsFile, subject, reports.AdminReportsAuditReadonlyScope)
+	if err != nil {
+		return nil, err
+	}
+	return &client{http: h, base: defaultBase, customerID: customerID}, nil
+}
+
+// delegatedHTTP returns an HTTP client acting as subject through the service account's domain-wide delegation.
+func delegatedHTTP(credentialsFile, subject string, scopes ...string) (*http.Client, error) {
 	raw, err := os.ReadFile(credentialsFile)
 	if err != nil {
 		return nil, fmt.Errorf("read credentials: %w", err)
 	}
-	jwt, err := google.JWTConfigFromJSON(raw, reports.AdminReportsAuditReadonlyScope)
+	jwt, err := google.JWTConfigFromJSON(raw, scopes...)
 	if err != nil {
 		return nil, fmt.Errorf("parse credentials: %w", err)
 	}
 	jwt.Subject = subject
-	httpClient := jwt.Client(context.Background())
-	httpClient.Timeout = 60 * time.Second
-	return &client{http: httpClient, base: defaultBase, customerID: customerID}, nil
+	h := jwt.Client(context.Background())
+	h.Timeout = 60 * time.Second
+	return h, nil
 }
 
 func (c *client) page(ctx context.Context, app string, start, end time.Time, token string) (*activityPage, error) {
@@ -82,6 +92,10 @@ func (c *client) page(ctx context.Context, app string, start, end time.Time, tok
 }
 
 func retryable(err error) bool {
+	var rerr *oauth2.RetrieveError
+	if errors.As(err, &rerr) {
+		return false
+	}
 	var gerr *googleapi.Error
 	if errors.As(err, &gerr) {
 		switch gerr.Code {
@@ -101,6 +115,10 @@ func retryable(err error) bool {
 }
 
 func unavailable(err error) bool {
+	var rerr *oauth2.RetrieveError
+	if errors.As(err, &rerr) {
+		return true
+	}
 	var gerr *googleapi.Error
 	if !errors.As(err, &gerr) {
 		return false
