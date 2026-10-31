@@ -3,7 +3,6 @@ package googleworkspace
 import (
 	"context"
 	"errors"
-	"sync"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -107,17 +106,12 @@ type input struct {
 	boff        *backoff.ExponentialBackOff
 	store       checkpoint.Store
 	log         *service.Logger
-	m           metrics
-
-	out     chan pull.Pending
-	mu      sync.Mutex
-	started bool
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
+	m           pull.Metrics
+	*pull.Driver
 }
 
 func newInput(conf *service.ParsedConfig, res *service.Resources) (service.BatchInput, error) {
-	in := &input{log: res.Logger(), m: newMetrics(res.Metrics()), out: make(chan pull.Pending)}
+	in := &input{log: res.Logger(), m: pull.NewMetrics(res.Metrics()), Driver: pull.NewDriver()}
 	var err error
 	if in.credentials, err = conf.FieldString(fCredentials); err != nil {
 		return nil, err
@@ -196,28 +190,19 @@ func parseOverlaps(conf *service.ParsedConfig, apps []string) (map[string]time.D
 }
 
 func (in *input) Connect(ctx context.Context) error {
-	in.mu.Lock()
-	defer in.mu.Unlock()
-	if in.started {
-		return nil
-	}
-	cl, err := newClient(in.credentials, in.subject, in.customerID)
-	if err != nil {
-		return err
-	}
-	runCtx, cancel := context.WithCancel(context.Background())
-	in.cancel = cancel
-	for _, app := range in.apps {
-		s := in.newStream(app, cl)
-		in.log.Infof("%s: polling every %s, overlap %s", app, in.timing.interval, s.overlap)
-		in.wg.Add(1)
-		go func() {
-			defer in.wg.Done()
-			s.run(runCtx)
-		}()
-	}
-	in.started = true
-	return nil
+	return in.Start(func() ([]func(context.Context), error) {
+		cl, err := newClient(in.credentials, in.subject, in.customerID)
+		if err != nil {
+			return nil, err
+		}
+		loops := make([]func(context.Context), 0, len(in.apps))
+		for _, app := range in.apps {
+			s := in.newStream(app, cl)
+			in.log.Infof("%s: polling every %s, overlap %s", app, in.timing.interval, s.overlap)
+			loops = append(loops, s.run)
+		}
+		return loops, nil
+	})
 }
 
 func (in *input) newStream(app string, p pager) *stream {
@@ -234,37 +219,17 @@ func (in *input) newStream(app string, p pager) *stream {
 		seen:    dedupe.NewSeen(),
 		boff:    &boff,
 		timing:  in.timing,
-		out:     in.out,
+		out:     in.Out(),
 		log:     in.log,
 		m:       in.m,
+		health:  pull.NewHealth(in.m, in.log, sourceName, app),
 		now:     time.Now,
 	}
 }
 
-func (in *input) ReadBatch(ctx context.Context) (service.MessageBatch, service.AckFunc, error) {
-	select {
-	case p := <-in.out:
-		return p.Batch, p.Ack, nil
-	case <-ctx.Done():
-		return nil, nil, ctx.Err()
-	}
-}
-
 func (in *input) Close(ctx context.Context) error {
-	in.mu.Lock()
-	if in.cancel != nil {
-		in.cancel()
-	}
-	in.mu.Unlock()
-	done := make(chan struct{})
-	go func() {
-		in.wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-ctx.Done():
-		return ctx.Err()
+	if err := in.Stop(ctx); err != nil {
+		return err
 	}
 	return in.store.Close(ctx)
 }

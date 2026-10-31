@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -126,17 +125,20 @@ type alertsInput struct {
 	customerID  string
 	stream      *alertStream
 	store       checkpoint.Store
-
-	out     chan pull.Pending
-	mu      sync.Mutex
-	started bool
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
+	*pull.Driver
 }
 
 func newAlertsInput(conf *service.ParsedConfig, res *service.Resources) (service.BatchInput, error) {
-	in := &alertsInput{out: make(chan pull.Pending)}
-	s := &alertStream{log: res.Logger(), m: newMetrics(res.Metrics()), seen: dedupe.NewSeen(), out: in.out, now: time.Now}
+	in := &alertsInput{Driver: pull.NewDriver()}
+	m := pull.NewMetrics(res.Metrics())
+	s := &alertStream{
+		log:    res.Logger(),
+		m:      m,
+		health: pull.NewHealth(m, res.Logger(), sourceName, "alerts"),
+		seen:   dedupe.NewSeen(),
+		out:    in.Out(),
+		now:    time.Now,
+	}
 	var err error
 	if in.credentials, err = conf.FieldString(fCredentials); err != nil {
 		return nil, err
@@ -185,52 +187,20 @@ func newAlertsInput(conf *service.ParsedConfig, res *service.Resources) (service
 }
 
 func (in *alertsInput) Connect(ctx context.Context) error {
-	in.mu.Lock()
-	defer in.mu.Unlock()
-	if in.started {
-		return nil
-	}
-	h, err := delegatedHTTP(in.credentials, in.subject, alertsScope)
-	if err != nil {
-		return err
-	}
-	in.stream.pager = &alertClient{http: h, base: alertsBase, customerID: in.customerID}
-	runCtx, cancel := context.WithCancel(context.Background())
-	in.cancel = cancel
-	in.stream.log.Infof("alerts: polling every %s, overlap %s", in.stream.interval, in.stream.overlap)
-	in.wg.Add(1)
-	go func() {
-		defer in.wg.Done()
-		in.stream.run(runCtx)
-	}()
-	in.started = true
-	return nil
-}
-
-func (in *alertsInput) ReadBatch(ctx context.Context) (service.MessageBatch, service.AckFunc, error) {
-	select {
-	case p := <-in.out:
-		return p.Batch, p.Ack, nil
-	case <-ctx.Done():
-		return nil, nil, ctx.Err()
-	}
+	return in.Start(func() ([]func(context.Context), error) {
+		h, err := delegatedHTTP(in.credentials, in.subject, alertsScope)
+		if err != nil {
+			return nil, err
+		}
+		in.stream.pager = &alertClient{http: h, base: alertsBase, customerID: in.customerID}
+		in.stream.log.Infof("alerts: polling every %s, overlap %s", in.stream.interval, in.stream.overlap)
+		return []func(context.Context){in.stream.run}, nil
+	})
 }
 
 func (in *alertsInput) Close(ctx context.Context) error {
-	in.mu.Lock()
-	if in.cancel != nil {
-		in.cancel()
-	}
-	in.mu.Unlock()
-	done := make(chan struct{})
-	go func() {
-		in.wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-ctx.Done():
-		return ctx.Err()
+	if err := in.Stop(ctx); err != nil {
+		return err
 	}
 	return in.store.Close(ctx)
 }
@@ -249,9 +219,9 @@ type alertStream struct {
 	unavailableWait time.Duration
 	out             chan<- pull.Pending
 	log             *service.Logger
-	m               metrics
+	m               pull.Metrics
+	health          *pull.Health
 	now             func() time.Time
-	dormant         bool
 }
 
 func (s *alertStream) run(ctx context.Context) {
@@ -270,12 +240,12 @@ func (s *alertStream) run(ctx context.Context) {
 				pull.Sleep(ctx, s.unavailableWait)
 				continue
 			}
-			s.m.errors.Incr(1, sourceName, "alerts")
+			s.m.Errors.Incr(1, sourceName, "alerts")
 			s.log.Errorf("alerts: poll failed: %v", err)
 			pull.Sleep(ctx, s.interval)
 			continue
 		}
-		s.markAvailable()
+		s.health.Up()
 		cursor = next
 		pull.Sleep(ctx, s.interval)
 	}
@@ -317,7 +287,7 @@ func (s *alertStream) poll(ctx context.Context, cursor time.Time) (time.Time, er
 		s.seen.Add(key, at)
 	}
 	s.seen.Prune(newest.Add(-s.overlap))
-	s.m.emitted.Incr(int64(len(fresh)), sourceName, "alerts")
+	s.m.Emitted.Incr(int64(len(fresh)), sourceName, "alerts")
 	if newest.After(cursor) {
 		if err := s.store.Set(ctx, s.key, []byte(newest.UTC().Format(time.RFC3339Nano))); err != nil {
 			return cursor, fmt.Errorf("save cursor: %w", err)
@@ -333,7 +303,7 @@ func (s *alertStream) batch(alerts []map[string]any, floor time.Time, fresh map[
 		updated := text(a["updateTime"])
 		at, err := time.Parse(time.RFC3339Nano, updated)
 		if err != nil {
-			s.m.skipped.Incr(1, sourceName, "alerts")
+			s.m.Skipped.Incr(1, sourceName, "alerts")
 			s.log.Warnf("alerts: skipping alert without updateTime: %v", err)
 			continue
 		}
@@ -347,14 +317,14 @@ func (s *alertStream) batch(alerts []map[string]any, floor time.Time, fresh map[
 		}
 		raw, err := json.Marshal(a)
 		if err != nil {
-			s.m.skipped.Incr(1, sourceName, "alerts")
+			s.m.Skipped.Incr(1, sourceName, "alerts")
 			continue
 		}
 		m := s.meta
 		m.EventID = envelope.ID(text(a["customerId"]), "alerts", alertID)
 		body, err := envelope.Envelope{Meta: m, Raw: string(raw)}.Marshal()
 		if err != nil {
-			s.m.skipped.Incr(1, sourceName, "alerts")
+			s.m.Skipped.Incr(1, sourceName, "alerts")
 			continue
 		}
 		fresh[version] = at
@@ -383,7 +353,7 @@ func (s *alertStream) loadCursor(ctx context.Context) (time.Time, bool) {
 			}
 			err = fmt.Errorf("corrupt cursor %q: %w", raw, perr)
 		}
-		s.m.errors.Incr(1, sourceName, "alerts")
+		s.m.Errors.Incr(1, sourceName, "alerts")
 		s.log.Errorf("alerts: load cursor: %v", err)
 		if !pull.Sleep(ctx, s.interval) {
 			return time.Time{}, false
@@ -392,22 +362,10 @@ func (s *alertStream) loadCursor(ctx context.Context) (time.Time, bool) {
 }
 
 func (s *alertStream) markUnavailable(err error) {
-	s.m.available.Set(0, sourceName, "alerts")
-	if !s.dormant {
-		s.dormant = true
-		s.log.Warnf("alerts: Alert Center not available (%v); check the API is enabled, the apps.alerts scope is delegated and the subject has Alert Center view access; retrying every %s", err, s.unavailableWait)
-	}
-}
-
-func (s *alertStream) markAvailable() {
-	s.m.available.Set(1, sourceName, "alerts")
-	if s.dormant {
-		s.dormant = false
-		s.log.Infof("alerts: available again")
-	}
+	s.health.Down(fmt.Sprintf("alerts: Alert Center not available (%v); check the API is enabled, the apps.alerts scope is delegated and the subject has Alert Center view access; retrying every %s", err, s.unavailableWait))
 }
 
 func (s *alertStream) onRetry(err error, wait time.Duration) {
-	s.m.errors.Incr(1, sourceName, "alerts")
+	s.m.Errors.Incr(1, sourceName, "alerts")
 	s.log.Warnf("alerts: retrying in %s: %v", wait.Round(time.Millisecond), err)
 }
