@@ -27,28 +27,6 @@ type timing struct {
 	unavailableWait time.Duration
 }
 
-type metrics struct {
-	emitted   *service.MetricCounter
-	late      *service.MetricCounter
-	skipped   *service.MetricCounter
-	errors    *service.MetricCounter
-	lag       *service.MetricGauge
-	lateness  *service.MetricTimer
-	available *service.MetricGauge
-}
-
-func newMetrics(m *service.Metrics) metrics {
-	return metrics{
-		emitted:   m.NewCounter("collector_events_emitted", "source", "application"),
-		late:      m.NewCounter("collector_events_late", "source", "application"),
-		skipped:   m.NewCounter("collector_events_malformed", "source", "application"),
-		errors:    m.NewCounter("collector_poll_errors", "source", "application"),
-		lag:       m.NewGauge("collector_cursor_lag_seconds", "source", "application"),
-		lateness:  m.NewTimer("collector_event_lateness", "source", "application"),
-		available: m.NewGauge("collector_application_available", "source", "application"),
-	}
-}
-
 // stream polls one applicationName with its own cursor, dedupe set and backoff.
 type stream struct {
 	app     string
@@ -62,10 +40,10 @@ type stream struct {
 	timing  timing
 	out     chan<- pull.Pending
 	log     *service.Logger
-	m       metrics
+	m       pull.Metrics
+	health  *pull.Health
 	now     func() time.Time
 	primed  bool
-	dormant bool
 }
 
 // span is one poll: fetch [cursor-back, end) and commit end.
@@ -99,17 +77,17 @@ func (s *stream) run(ctx context.Context) {
 				pull.Sleep(ctx, s.timing.unavailableWait)
 				continue
 			}
-			s.m.errors.Incr(1, sourceName, s.app)
+			s.m.Errors.Incr(1, sourceName, s.app)
 			s.log.Errorf("%s: window %s..%s failed: %v", s.app, cursor.Format(time.RFC3339), sp.end.Format(time.RFC3339), err)
 			pull.Sleep(ctx, s.timing.interval)
 			continue
 		}
-		s.markAvailable()
+		s.health.Up()
 		if sweeping {
 			lastSweep = now
 		}
 		cursor = sp.end
-		s.m.lag.Set(int64(s.now().Sub(cursor).Seconds()), sourceName, s.app)
+		s.m.Lag.Set(int64(s.now().Sub(cursor).Seconds()), sourceName, s.app)
 		if sp.end.Equal(now) {
 			pull.Sleep(ctx, s.timing.interval)
 		}
@@ -162,7 +140,7 @@ func (s *stream) record(sp span, fresh map[string]time.Time) {
 		if s.primed && at.Before(sp.cursor) {
 			late++
 			lateness := seenAt.Sub(at)
-			s.m.lateness.Timing(lateness.Nanoseconds(), sourceName, s.app)
+			s.m.Lateness.Timing(lateness.Nanoseconds(), sourceName, s.app)
 			if lateness > s.overlap*8/10 {
 				s.log.Warnf("%s: event arrived %s late, close to the %s overlap; raise it to avoid losing events", s.app, lateness.Round(time.Second), s.overlap)
 			}
@@ -170,8 +148,8 @@ func (s *stream) record(sp span, fresh map[string]time.Time) {
 	}
 	s.primed = true
 	s.seen.Prune(sp.end.Add(-s.overlap))
-	s.m.emitted.Incr(int64(len(fresh)), sourceName, s.app)
-	s.m.late.Incr(int64(late), sourceName, s.app)
+	s.m.Emitted.Incr(int64(len(fresh)), sourceName, s.app)
+	s.m.Late.Incr(int64(late), sourceName, s.app)
 }
 
 func (s *stream) batch(items []map[string]any, fresh map[string]time.Time) service.MessageBatch {
@@ -179,7 +157,7 @@ func (s *stream) batch(items []map[string]any, fresh map[string]time.Time) servi
 	for _, a := range items {
 		evs, err := split(a, s.app, s.meta)
 		if err != nil {
-			s.m.skipped.Incr(1, sourceName, s.app)
+			s.m.Skipped.Incr(1, sourceName, s.app)
 			s.log.Warnf("%s: skipping malformed activity: %v", s.app, err)
 			continue
 		}
@@ -211,7 +189,7 @@ func (s *stream) loadCursor(ctx context.Context) (time.Time, bool) {
 			}
 			err = fmt.Errorf("corrupt cursor %q: %w", raw, perr)
 		}
-		s.m.errors.Incr(1, sourceName, s.app)
+		s.m.Errors.Incr(1, sourceName, s.app)
 		s.log.Errorf("%s: load cursor: %v", s.app, err)
 		if !pull.Sleep(ctx, s.timing.interval) {
 			return time.Time{}, false
@@ -221,22 +199,10 @@ func (s *stream) loadCursor(ctx context.Context) (time.Time, bool) {
 
 // markUnavailable logs once when the tenant's plan or permissions do not offer this log type; polling continues at a slow rate.
 func (s *stream) markUnavailable(err error) {
-	s.m.available.Set(0, sourceName, s.app)
-	if !s.dormant {
-		s.dormant = true
-		s.log.Warnf("%s: not available to this tenant (%v); retrying every %s", s.app, err, s.timing.unavailableWait)
-	}
-}
-
-func (s *stream) markAvailable() {
-	s.m.available.Set(1, sourceName, s.app)
-	if s.dormant {
-		s.dormant = false
-		s.log.Infof("%s: available again", s.app)
-	}
+	s.health.Down(fmt.Sprintf("%s: not available to this tenant (%v); retrying every %s", s.app, err, s.timing.unavailableWait))
 }
 
 func (s *stream) onRetry(err error, wait time.Duration) {
-	s.m.errors.Incr(1, sourceName, s.app)
+	s.m.Errors.Incr(1, sourceName, s.app)
 	s.log.Warnf("%s: retrying in %s: %v", s.app, wait.Round(time.Millisecond), err)
 }
