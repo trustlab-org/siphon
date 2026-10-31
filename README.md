@@ -39,7 +39,7 @@ A super admin account is needed for these steps
 
 ### 2. Create a service account and key
 
-1. In [Google Cloud console](https://console.cloud.google.com), signed in as the super admin and create inside your organization.
+1. In [Google Cloud console](https://console.cloud.google.com), signed in as the super admin, create a project inside your organization.
 2. Go to APIs & Services, Library and enable the [Admin SDK API](https://console.cloud.google.com/apis/library/admin.googleapis.com).
 3. Go to [IAM & Admin, Service accounts](https://console.cloud.google.com/iam-admin/serviceaccounts), Create service account. Do not grant it any roles.
 4. Open the service account then Keys, there Create new key, JSON. The key file downloads.

@@ -4,6 +4,7 @@ go 1.27.1
 
 require (
 	github.com/cenkalti/backoff/v4 v4.3.0
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/warpstreamlabs/bento v1.21.2
 	golang.org/x/oauth2 v0.37.0
 	google.golang.org/api v0.299.0
@@ -42,7 +43,6 @@ require (
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/gofrs/uuid v4.4.0+incompatible // indirect
-	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
 	github.com/google/s2a-go v0.1.10 // indirect
 	github.com/google/uuid v1.6.0 // indirect

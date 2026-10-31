@@ -10,6 +10,7 @@ import (
 	"github.com/warpstreamlabs/bento/public/service"
 
 	_ "github.com/HelixY2J/collector/internal/source/googleworkspace"
+	_ "github.com/HelixY2J/collector/internal/source/okta"
 )
 
 var (
