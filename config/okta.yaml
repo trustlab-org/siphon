@@ -1,0 +1,37 @@
+http:
+  address: ${COLLECTOR_HTTP_ADDR:0.0.0.0:4196}
+
+input:
+  okta_system_log:
+    org_url: ${OKTA_ORG_URL:}
+    client_id: ${OKTA_CLIENT_ID:}
+    key_id: ${OKTA_KEY_ID:}
+    private_key_file: ${OKTA_PRIVATE_KEY_FILE:}
+    org: ${COLLECTOR_ORG:example-university}
+    server: ${COLLECTOR_SERVER:okta}
+    poll_interval: 1m
+    initial_lookback: ${OKTA_INITIAL_LOOKBACK:24h}
+    checkpoint:
+      type: file
+      path: ${COLLECTOR_STATE_DIR:./state}/okta-checkpoints.json
+
+output:
+  switch:
+    cases:
+      - check: env("COLLECTOR_OUTPUT") == "kafka"
+        output:
+          kafka_franz:
+            seed_brokers: [ "${KAFKA_BROKERS:localhost:9094}" ]
+            topic: ${KAFKA_TOPIC:okta}
+            key: ${! meta("event_id") }
+            max_in_flight: 1
+      - output:
+          stdout:
+            codec: lines
+
+metrics:
+  prometheus: {}
+
+logger:
+  level: ${LOG_LEVEL:INFO}
+  format: logfmt

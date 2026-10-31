@@ -3,3 +3,4 @@ bin/
 state/
 secrets/
 deploy/gws/gws.env
+deploy/okta/okta.env
